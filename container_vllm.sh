@@ -15,6 +15,11 @@ export HF_CACHE_DIR="$HOME/.cache/huggingface"
 
 probe_container() {
   local cid="$1"
+  request_container "$cid" >/dev/null
+}
+
+request_container() {
+  local cid="$1"
   curl --max-time 60 --silent http://127.0.0.1:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d "{
@@ -24,7 +29,7 @@ probe_container() {
       ],
       \"max_tokens\": 32,
       \"temperature\": 0
-    }" >/dev/null
+    }"
 }
 
 run_one_image() {
@@ -75,6 +80,16 @@ run_one_image() {
     return 1
   fi
 
+  echo "Pre-checkpoint request:"
+  if ! request_container "$cid"; then
+    echo
+    echo "Pre-checkpoint request failed."
+    docker logs "$cid" || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+    return 1
+  fi
+  echo
+
   mapfile -t CUDA_PIDS < <(
     while IFS= read -r pid; do
       state="$(docker exec "$cid" /cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint --get-state --pid "$pid" 2>/dev/null || true)"
@@ -117,13 +132,15 @@ run_one_image() {
     docker exec "$cid" /cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint --get-state --pid "$p" || true
   done
 
-  echo "Post-uncheckpoint probe..."
-  if probe_container "$cid"; then
+  echo "Post-uncheckpoint request:"
+  if request_container "$cid"; then
+    echo
     echo "SUCCESS on $image"
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 0
   else
-    echo "Post-uncheckpoint probe failed on $image"
+    echo
+    echo "Post-uncheckpoint request failed on $image"
     docker logs "$cid" || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 1
