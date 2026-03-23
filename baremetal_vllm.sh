@@ -12,33 +12,13 @@ PORT="${PORT:-8000}"
 DP_SIZE="${DP_SIZE:-4}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.10}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
-EXPERIMENT="${EXPERIMENT:-all}"         # all | private_shm | private_shm_fork
 PRIVATE_SHM_SIZE="${PRIVATE_SHM_SIZE:-16G}"
-IN_EXPERIMENT_NS="${IN_EXPERIMENT_NS:-0}"
-BASE_LOGFILE="${LOGFILE:-vllm_baremetal.log}"
+IN_PRIVATE_SHM_NS="${IN_PRIVATE_SHM_NS:-0}"
+LOGFILE="${LOGFILE:-vllm_baremetal.log}"
 CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint}"
 CRIU_BIN="${CRIU_BIN:-criu}"
-BASE_CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal}"
+CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal}"
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-1}"
-
-case "$EXPERIMENT" in
-  private_shm)
-    LOGFILE="${LOGFILE:-${BASE_LOGFILE%.log}_private_shm.log}"
-    CKPT_DIR="${CKPT_DIR:-${BASE_CKPT_DIR}_private_shm}"
-    ;;
-  private_shm_fork)
-    LOGFILE="${LOGFILE:-${BASE_LOGFILE%.log}_private_shm_fork.log}"
-    CKPT_DIR="${CKPT_DIR:-${BASE_CKPT_DIR}_private_shm_fork}"
-    ;;
-  all)
-    LOGFILE="${LOGFILE:-$BASE_LOGFILE}"
-    CKPT_DIR="${CKPT_DIR:-$BASE_CKPT_DIR}"
-    ;;
-  *)
-    echo "Unknown EXPERIMENT=$EXPERIMENT"
-    exit 1
-    ;;
-esac
 
 SERVER_PID=""
 ORIGINAL_SERVER_PID=""
@@ -351,6 +331,26 @@ append_cuda_pids_by_name_prefix() {
   fi
 }
 
+append_all_pids_by_name_prefix_to_cuda() {
+  local prefix="$1"
+  local label="${2:-$1}"
+  local pid
+  local matched=0
+
+  while IFS= read -r pid; do
+    matched=1
+    append_all_pid "$pid"
+    if [[ -z "${SEEN_PIDS[$pid]:-}" ]]; then
+      CUDA_PIDS+=("$pid")
+      SEEN_PIDS["$pid"]=1
+    fi
+  done < <(find_pids_by_name_prefix "$prefix")
+
+  if [[ "$matched" -eq 0 ]]; then
+    printf 'ERROR: expected process not found by name: %s\n' "$label" >&2
+  fi
+}
+
 collect_vllm_processes() {
   CUDA_PIDS=()
   ALL_VLLM_PIDS=()
@@ -374,6 +374,35 @@ collect_vllm_processes() {
   for (( idx=0; idx<DP_SIZE; idx++ )); do
     append_all_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
     append_cuda_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
+  done
+}
+
+collect_restored_vllm_processes() {
+  CUDA_PIDS=()
+  ALL_VLLM_PIDS=()
+  SEEN_PIDS=()
+  SEEN_ALL_PIDS=()
+
+  append_all_pid "$SERVER_PID"
+  if [[ -d "/proc/$SERVER_PID" ]]; then
+    CUDA_PIDS+=("$SERVER_PID")
+    SEEN_PIDS["$SERVER_PID"]=1
+  fi
+
+  append_all_pids_by_name_prefix "VLLM::Worker" "VLLM::Worker"
+  append_all_pids_by_name_prefix_to_cuda "VLLM::Worker" "VLLM::Worker"
+
+  append_all_pids_by_name_prefix "VLLM::DPCoordinator" "VLLM::DPCoordinator"
+  append_all_pids_by_name_prefix_to_cuda "VLLM::DPCoordinator" "VLLM::DPCoordinator"
+
+  for (( idx=0; idx<DP_SIZE; idx++ )); do
+    append_all_pids_by_name_prefix "VLLM::EngineCore_DP${idx}" "VLLM::EngineCore_DP${idx}"
+    append_all_pids_by_name_prefix_to_cuda "VLLM::EngineCore_DP${idx}" "VLLM::EngineCore_DP${idx}"
+  done
+
+  for (( idx=0; idx<DP_SIZE; idx++ )); do
+    append_all_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
+    append_all_pids_by_name_prefix_to_cuda "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
   done
 }
 
@@ -495,62 +524,27 @@ trap cleanup EXIT
 trap 'handle_exit_signal INT' INT
 trap 'handle_exit_signal TERM' TERM
 
-run_all_experiments() {
-  local script_path
-  local exp
-  local rc=0
-
-  script_path="$(readlink -f "$0")"
-
-  for exp in private_shm private_shm_fork; do
-    echo
-    echo "=============================="
-    echo "Running experiment: $exp"
-    echo "=============================="
-    echo
-    if ! EXPERIMENT="$exp" LOGFILE="" CKPT_DIR="" bash "$script_path"; then
-      echo
-      echo "Experiment failed: $exp"
-      rc=1
-    else
-      echo
-      echo "Experiment succeeded: $exp"
-    fi
-  done
-
-  return "$rc"
-}
-
-enter_private_namespace_if_needed() {
+enter_private_shm_namespace_if_needed() {
   local script_path
   local workdir
 
   script_path="$(readlink -f "$0")"
   workdir="$PWD"
 
-  [[ "$IN_EXPERIMENT_NS" == "0" ]] || return 0
+  [[ "$IN_PRIVATE_SHM_NS" == "0" ]] || return 0
 
-  case "$EXPERIMENT" in
-    private_shm|private_shm_fork)
-      export IN_EXPERIMENT_NS=1
-      exec sudo --preserve-env=PATH,HOME,USER,LOGNAME,SHELL,PWD,CONDA_PREFIX,LD_LIBRARY_PATH,PYTHONPATH,MODEL,CUDA_VISIBLE_DEVICES,UV_USE_IO_URING,VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION,NCCL_IB_DISABLE,USE_LIBUV,PORT,DP_SIZE,GPU_MEMORY_UTILIZATION,MAX_MODEL_LEN,LOGFILE,CUDA_CHECKPOINT_BIN,CRIU_BIN,CKPT_DIR,CLEANUP_ON_EXIT,EXPERIMENT,PRIVATE_SHM_SIZE,IN_EXPERIMENT_NS,BASE_LOGFILE,BASE_CKPT_DIR \
-        unshare --mount --ipc --fork bash -lc "
-          set -euo pipefail
-          cd \"$workdir\"
-          mount --make-rprivate /
-          mount -t tmpfs -o mode=1777,nosuid,nodev,size=${PRIVATE_SHM_SIZE} shm /dev/shm
-          exec bash \"$script_path\"
-        "
-      ;;
-  esac
+  export IN_PRIVATE_SHM_NS=1
+  exec sudo --preserve-env=PATH,HOME,USER,LOGNAME,SHELL,PWD,CONDA_PREFIX,LD_LIBRARY_PATH,PYTHONPATH,MODEL,CUDA_VISIBLE_DEVICES,UV_USE_IO_URING,VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION,NCCL_IB_DISABLE,USE_LIBUV,PORT,DP_SIZE,GPU_MEMORY_UTILIZATION,MAX_MODEL_LEN,LOGFILE,CUDA_CHECKPOINT_BIN,CRIU_BIN,CKPT_DIR,CLEANUP_ON_EXIT,PRIVATE_SHM_SIZE,IN_PRIVATE_SHM_NS \
+    unshare --mount --ipc --fork bash -lc "
+      set -euo pipefail
+      cd \"$workdir\"
+      mount --make-rprivate /
+      mount -t tmpfs -o mode=1777,nosuid,nodev,size=${PRIVATE_SHM_SIZE} shm /dev/shm
+      exec bash \"$script_path\"
+    "
 }
 
-if [[ "$EXPERIMENT" == "all" && "$IN_EXPERIMENT_NS" == "0" ]]; then
-  run_all_experiments
-  exit $?
-fi
-
-enter_private_namespace_if_needed
+enter_private_shm_namespace_if_needed
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not in PATH."
@@ -583,20 +577,6 @@ if [[ -n "$MAX_MODEL_LEN" ]]; then
   VLLM_ARGS+=(--max-model-len "$MAX_MODEL_LEN")
 fi
 
-case "$EXPERIMENT" in
-  private_shm)
-    unset VLLM_WORKER_MULTIPROC_METHOD || true
-    ;;
-  private_shm_fork)
-    export VLLM_WORKER_MULTIPROC_METHOD=fork
-    ;;
-esac
-
-echo "========================================"
-echo "Experiment: $EXPERIMENT"
-echo "Log file:    $LOGFILE"
-echo "CKPT dir:    $CKPT_DIR"
-echo "========================================"
 echo "Starting vLLM on bare metal..."
 echo "Local vLLM version: $(get_local_vllm_version)"
 printf 'Launch command: vllm'
@@ -608,12 +588,10 @@ SERVER_PID=$!
 ORIGINAL_SERVER_PID="$SERVER_PID"
 
 echo "Server PID: $SERVER_PID"
-echo "Experiment: $EXPERIMENT"
 echo "Server mount namespace: $(readlink /proc/$SERVER_PID/ns/mnt)"
 echo "Server IPC namespace:   $(readlink /proc/$SERVER_PID/ns/ipc)"
 echo "Server /dev/shm mount:"
 awk '$5=="/dev/shm"{print}' /proc/$SERVER_PID/mountinfo || true
-echo "VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-<unset>}"
 echo "Log file: $LOGFILE"
 echo "Waiting for vLLM..."
 for _ in $(seq 1 300); do
@@ -708,10 +686,10 @@ sleep 2
 echo "criu restore completed"
 
 echo "Re-discovering restored vLLM processes..."
-collect_vllm_processes
+collect_restored_vllm_processes
 
 if [[ "${#CUDA_PIDS[@]}" -eq 0 ]]; then
-  echo "No restored CUDA-checkpointable PIDs found."
+  echo "No restored CUDA processes found."
   exit 1
 fi
 
