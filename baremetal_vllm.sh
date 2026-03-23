@@ -12,14 +12,37 @@ PORT="${PORT:-8000}"
 DP_SIZE="${DP_SIZE:-4}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.10}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
-LOGFILE="${LOGFILE:-vllm_baremetal.log}"
+EXPERIMENT="${EXPERIMENT:-all}"         # all | private_shm | private_shm_fork
+PRIVATE_SHM_SIZE="${PRIVATE_SHM_SIZE:-16G}"
+IN_EXPERIMENT_NS="${IN_EXPERIMENT_NS:-0}"
+BASE_LOGFILE="${LOGFILE:-vllm_baremetal.log}"
 CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint}"
 CRIU_BIN="${CRIU_BIN:-criu}"
-CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal}"
-CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-0}"
+BASE_CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal}"
+CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-1}"
+
+case "$EXPERIMENT" in
+  private_shm)
+    LOGFILE="${LOGFILE:-${BASE_LOGFILE%.log}_private_shm.log}"
+    CKPT_DIR="${CKPT_DIR:-${BASE_CKPT_DIR}_private_shm}"
+    ;;
+  private_shm_fork)
+    LOGFILE="${LOGFILE:-${BASE_LOGFILE%.log}_private_shm_fork.log}"
+    CKPT_DIR="${CKPT_DIR:-${BASE_CKPT_DIR}_private_shm_fork}"
+    ;;
+  all)
+    LOGFILE="${LOGFILE:-$BASE_LOGFILE}"
+    CKPT_DIR="${CKPT_DIR:-$BASE_CKPT_DIR}"
+    ;;
+  *)
+    echo "Unknown EXPERIMENT=$EXPERIMENT"
+    exit 1
+    ;;
+esac
 
 SERVER_PID=""
 ORIGINAL_SERVER_PID=""
+CLEANUP_DONE=0
 
 request_server() {
   curl --max-time 60 --silent "http://127.0.0.1:${PORT}/v1/chat/completions" \
@@ -392,7 +415,6 @@ dump_criu_roots() {
       --tcp-established \
       --ext-unix-sk \
       --link-remap \
-      --shell-job \
       -o "$tree_dir/dump.log" \
       -v4
   done
@@ -411,7 +433,6 @@ restore_criu_roots() {
       --tcp-established \
       --ext-unix-sk \
       --link-remap \
-      --shell-job \
       --restore-detached \
       --pidfile "$tree_dir/restored_root.pid" \
       -o "$tree_dir/restore.log" \
@@ -430,15 +451,106 @@ restore_criu_roots() {
   done
 }
 
-cleanup() {
-  [[ "$CLEANUP_ON_EXIT" == "1" ]] || return
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-    kill -- -"${SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+kill_process_group() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return 0
+  kill -0 "$pid" >/dev/null 2>&1 || return 0
+
+  echo "Cleaning up process group rooted at PID $pid ($(get_process_name "$pid"))"
+  kill -- -"${pid}" >/dev/null 2>&1 || sudo kill -- -"${pid}" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    sleep 1
+  fi
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill -KILL -- -"${pid}" >/dev/null 2>&1 || sudo kill -KILL -- -"${pid}" >/dev/null 2>&1 || true
   fi
 }
 
+cleanup() {
+  [[ "$CLEANUP_DONE" == "0" ]] || return
+  CLEANUP_DONE=1
+
+  [[ "$CLEANUP_ON_EXIT" == "1" ]] || return
+
+  kill_process_group "${SERVER_PID:-}"
+  if [[ -n "${ORIGINAL_SERVER_PID:-}" && "${ORIGINAL_SERVER_PID}" != "${SERVER_PID:-}" ]]; then
+    kill_process_group "$ORIGINAL_SERVER_PID"
+  fi
+}
+
+handle_exit_signal() {
+  local sig="$1"
+  trap - EXIT INT TERM
+  cleanup
+  case "$sig" in
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+  esac
+}
+
 trap cleanup EXIT
+trap 'handle_exit_signal INT' INT
+trap 'handle_exit_signal TERM' TERM
+
+run_all_experiments() {
+  local script_path
+  local exp
+  local rc=0
+
+  script_path="$(readlink -f "$0")"
+
+  for exp in private_shm private_shm_fork; do
+    echo
+    echo "=============================="
+    echo "Running experiment: $exp"
+    echo "=============================="
+    echo
+    if ! EXPERIMENT="$exp" LOGFILE="" CKPT_DIR="" bash "$script_path"; then
+      echo
+      echo "Experiment failed: $exp"
+      rc=1
+    else
+      echo
+      echo "Experiment succeeded: $exp"
+    fi
+  done
+
+  return "$rc"
+}
+
+enter_private_namespace_if_needed() {
+  local script_path
+  local workdir
+
+  script_path="$(readlink -f "$0")"
+  workdir="$PWD"
+
+  [[ "$IN_EXPERIMENT_NS" == "0" ]] || return 0
+
+  case "$EXPERIMENT" in
+    private_shm|private_shm_fork)
+      export IN_EXPERIMENT_NS=1
+      exec sudo --preserve-env=PATH,HOME,USER,LOGNAME,SHELL,PWD,CONDA_PREFIX,LD_LIBRARY_PATH,PYTHONPATH,MODEL,CUDA_VISIBLE_DEVICES,UV_USE_IO_URING,VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION,NCCL_IB_DISABLE,USE_LIBUV,PORT,DP_SIZE,GPU_MEMORY_UTILIZATION,MAX_MODEL_LEN,LOGFILE,CUDA_CHECKPOINT_BIN,CRIU_BIN,CKPT_DIR,CLEANUP_ON_EXIT,EXPERIMENT,PRIVATE_SHM_SIZE,IN_EXPERIMENT_NS,BASE_LOGFILE,BASE_CKPT_DIR \
+        unshare --mount --ipc --fork bash -lc "
+          set -euo pipefail
+          cd \"$workdir\"
+          mount --make-rprivate /
+          mount -t tmpfs -o mode=1777,nosuid,nodev,size=${PRIVATE_SHM_SIZE} shm /dev/shm
+          exec bash \"$script_path\"
+        "
+      ;;
+  esac
+}
+
+if [[ "$EXPERIMENT" == "all" && "$IN_EXPERIMENT_NS" == "0" ]]; then
+  run_all_experiments
+  exit $?
+fi
+
+enter_private_namespace_if_needed
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not in PATH."
@@ -471,6 +583,20 @@ if [[ -n "$MAX_MODEL_LEN" ]]; then
   VLLM_ARGS+=(--max-model-len "$MAX_MODEL_LEN")
 fi
 
+case "$EXPERIMENT" in
+  private_shm)
+    unset VLLM_WORKER_MULTIPROC_METHOD || true
+    ;;
+  private_shm_fork)
+    export VLLM_WORKER_MULTIPROC_METHOD=fork
+    ;;
+esac
+
+echo "========================================"
+echo "Experiment: $EXPERIMENT"
+echo "Log file:    $LOGFILE"
+echo "CKPT dir:    $CKPT_DIR"
+echo "========================================"
 echo "Starting vLLM on bare metal..."
 echo "Local vLLM version: $(get_local_vllm_version)"
 printf 'Launch command: vllm'
@@ -482,6 +608,12 @@ SERVER_PID=$!
 ORIGINAL_SERVER_PID="$SERVER_PID"
 
 echo "Server PID: $SERVER_PID"
+echo "Experiment: $EXPERIMENT"
+echo "Server mount namespace: $(readlink /proc/$SERVER_PID/ns/mnt)"
+echo "Server IPC namespace:   $(readlink /proc/$SERVER_PID/ns/ipc)"
+echo "Server /dev/shm mount:"
+awk '$5=="/dev/shm"{print}' /proc/$SERVER_PID/mountinfo || true
+echo "VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-<unset>}"
 echo "Log file: $LOGFILE"
 echo "Waiting for vLLM..."
 for _ in $(seq 1 300); do
