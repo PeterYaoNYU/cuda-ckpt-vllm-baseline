@@ -3,6 +3,10 @@ set -euo pipefail
 
 export MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export UV_USE_IO_URING="${UV_USE_IO_URING:-0}"
+export VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION="${VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION:-1}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export USE_LIBUV="${USE_LIBUV:-0}"
 
 PORT="${PORT:-8000}"
 DP_SIZE="${DP_SIZE:-4}"
@@ -10,8 +14,12 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 LOGFILE="${LOGFILE:-vllm_baremetal.log}"
 CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint}"
+CRIU_BIN="${CRIU_BIN:-criu}"
+CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal}"
+CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-0}"
 
 SERVER_PID=""
+ORIGINAL_SERVER_PID=""
 
 request_server() {
   curl --max-time 60 --silent "http://127.0.0.1:${PORT}/v1/chat/completions" \
@@ -34,6 +42,29 @@ get_local_vllm_version() {
   python -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo "<unknown>"
 }
 
+get_parent_pid() {
+  local pid="$1"
+
+  awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true
+}
+
+is_descendant_of() {
+  local pid="$1"
+  local root="$2"
+  local parent
+
+  while [[ -n "$pid" && "$pid" != "0" ]]; do
+    if [[ "$pid" == "$root" ]]; then
+      return 0
+    fi
+    parent="$(get_parent_pid "$pid")"
+    [[ -n "$parent" && "$parent" != "$pid" ]] || break
+    pid="$parent"
+  done
+
+  return 1
+}
+
 get_process_name() {
   local pid="$1"
   local proc_name=""
@@ -51,6 +82,47 @@ get_process_name() {
   printf '%s\n' "$proc_name"
 }
 
+process_uses_io_uring() {
+  local pid="$1"
+  local fd
+  local target
+
+  [[ -d "/proc/$pid" ]] || return 1
+
+  if grep -q 'anon_inode:\[io_uring\]' "/proc/$pid/maps" 2>/dev/null; then
+    return 0
+  fi
+
+  for fd in /proc/"$pid"/fd/*; do
+    [[ -e "$fd" ]] || continue
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    if [[ "$target" == "anon_inode:[io_uring]" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+print_io_uring_processes() {
+  local pid
+  local found=0
+
+  echo "vLLM processes using io_uring:"
+  for pid in "${ALL_VLLM_PIDS[@]}"; do
+    if process_uses_io_uring "$pid"; then
+      found=1
+      printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
+      grep -n 'anon_inode:\[io_uring\]' "/proc/$pid/maps" 2>/dev/null || true
+      ls -l "/proc/$pid/fd" 2>/dev/null | grep 'io_uring' || true
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "  none"
+  fi
+}
+
 find_pids_by_name_prefix() {
   local prefix="$1"
   local pid
@@ -65,6 +137,17 @@ find_pids_by_name_prefix() {
   done | sort -n
 }
 
+append_all_pid() {
+  local pid="$1"
+
+  [[ -n "$pid" ]] || return
+  [[ -d "/proc/$pid" ]] || return
+  [[ -n "${SEEN_ALL_PIDS[$pid]:-}" ]] && return
+
+  ALL_VLLM_PIDS+=("$pid")
+  SEEN_ALL_PIDS["$pid"]=1
+}
+
 append_cuda_pid_if_running() {
   local pid="$1"
   local state
@@ -77,6 +160,22 @@ append_cuda_pid_if_running() {
   if [[ "$state" == "running" ]]; then
     CUDA_PIDS+=("$pid")
     SEEN_PIDS["$pid"]=1
+  fi
+}
+
+append_all_pids_by_name_prefix() {
+  local prefix="$1"
+  local label="${2:-$1}"
+  local pid
+  local matched=0
+
+  while IFS= read -r pid; do
+    matched=1
+    append_all_pid "$pid"
+  done < <(find_pids_by_name_prefix "$prefix")
+
+  if [[ "$matched" -eq 0 ]]; then
+    printf 'ERROR: expected process not found by name: %s\n' "$label" >&2
   fi
 }
 
@@ -101,7 +200,110 @@ append_cuda_pids_by_name_prefix() {
   fi
 }
 
+collect_vllm_processes() {
+  CUDA_PIDS=()
+  ALL_VLLM_PIDS=()
+  SEEN_PIDS=()
+  SEEN_ALL_PIDS=()
+
+  append_all_pid "$SERVER_PID"
+  append_cuda_pid_if_running "$SERVER_PID"
+
+  append_all_pids_by_name_prefix "VLLM::Worker" "VLLM::Worker"
+  append_cuda_pids_by_name_prefix "VLLM::Worker" "VLLM::Worker"
+
+  append_all_pids_by_name_prefix "VLLM::DPCoordinator" "VLLM::DPCoordinator"
+  append_cuda_pids_by_name_prefix "VLLM::DPCoordinator" "VLLM::DPCoordinator"
+
+  for (( idx=0; idx<DP_SIZE; idx++ )); do
+    append_all_pids_by_name_prefix "VLLM::EngineCore_DP${idx}" "VLLM::EngineCore_DP${idx}"
+    append_cuda_pids_by_name_prefix "VLLM::EngineCore_DP${idx}" "VLLM::EngineCore_DP${idx}"
+  done
+
+  for (( idx=0; idx<DP_SIZE; idx++ )); do
+    append_all_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
+    append_cuda_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
+  done
+}
+
+compute_criu_root_pids() {
+  local pid
+  local parent
+
+  CRIU_ROOT_PIDS=()
+  SEEN_CRIU_ROOTS=()
+  ALL_UNDER_SERVER_ROOT=1
+
+  for pid in "${ALL_VLLM_PIDS[@]}"; do
+    if ! is_descendant_of "$pid" "$SERVER_PID"; then
+      ALL_UNDER_SERVER_ROOT=0
+    fi
+
+    parent="$(get_parent_pid "$pid")"
+    if [[ -z "${SEEN_ALL_PIDS[$parent]:-}" && -z "${SEEN_CRIU_ROOTS[$pid]:-}" ]]; then
+      CRIU_ROOT_PIDS+=("$pid")
+      SEEN_CRIU_ROOTS["$pid"]=1
+    fi
+  done
+}
+
+dump_criu_roots() {
+  local root_pid
+  local tree_dir
+
+  mkdir -p "$CKPT_DIR"
+
+  for root_pid in "${CRIU_ROOT_PIDS[@]}"; do
+    tree_dir="$CKPT_DIR/tree_${root_pid}"
+    rm -rf "$tree_dir"
+    mkdir -p "$tree_dir"
+    echo "CRIU dump root PID $root_pid ($(get_process_name "$root_pid")) -> $tree_dir"
+    sudo "$CRIU_BIN" dump \
+      --tree "$root_pid" \
+      --images-dir "$tree_dir" \
+      --tcp-established \
+      --ext-unix-sk \
+      --link-remap \
+      --shell-job \
+      -o "$tree_dir/dump.log" \
+      -v4
+  done
+}
+
+restore_criu_roots() {
+  local root_pid
+  local tree_dir
+  local restored_pid
+
+  for root_pid in "${CRIU_ROOT_PIDS[@]}"; do
+    tree_dir="$CKPT_DIR/tree_${root_pid}"
+    echo "CRIU restore root PID $root_pid from $tree_dir"
+    sudo "$CRIU_BIN" restore \
+      --images-dir "$tree_dir" \
+      --tcp-established \
+      --ext-unix-sk \
+      --link-remap \
+      --shell-job \
+      --restore-detached \
+      --pidfile "$tree_dir/restored_root.pid" \
+      -o "$tree_dir/restore.log" \
+      -v4
+
+    restored_pid="$(sudo cat "$tree_dir/restored_root.pid" 2>/dev/null || true)"
+    if [[ -z "$restored_pid" ]]; then
+      echo "Failed to read restored PID for CRIU root $root_pid"
+      exit 1
+    fi
+
+    echo "Restored root PID for original $root_pid: $restored_pid"
+    if [[ "$root_pid" == "$ORIGINAL_SERVER_PID" ]]; then
+      SERVER_PID="$restored_pid"
+    fi
+  done
+}
+
 cleanup() {
+  [[ "$CLEANUP_ON_EXIT" == "1" ]] || return
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
     kill -- -"${SERVER_PID}" >/dev/null 2>&1 || true
     wait "${SERVER_PID}" >/dev/null 2>&1 || true
@@ -117,6 +319,11 @@ fi
 
 if [[ ! -x "${CUDA_CHECKPOINT_BIN}" ]]; then
   echo "cuda-checkpoint binary not found: ${CUDA_CHECKPOINT_BIN}"
+  exit 1
+fi
+
+if ! command -v "$CRIU_BIN" >/dev/null 2>&1; then
+  echo "criu is not in PATH."
   exit 1
 fi
 
@@ -144,6 +351,7 @@ printf '\n'
 
 setsid vllm "${VLLM_ARGS[@]}" >"$LOGFILE" 2>&1 < /dev/null &
 SERVER_PID=$!
+ORIGINAL_SERVER_PID="$SERVER_PID"
 
 echo "Server PID: $SERVER_PID"
 echo "Log file: $LOGFILE"
@@ -176,23 +384,40 @@ if ! request_server; then
 fi
 echo
 declare -a CUDA_PIDS=()
+declare -a ALL_VLLM_PIDS=()
+declare -a CRIU_ROOT_PIDS=()
 declare -A SEEN_PIDS=()
+declare -A SEEN_ALL_PIDS=()
+declare -A SEEN_CRIU_ROOTS=()
+ALL_UNDER_SERVER_ROOT=1
 
-append_cuda_pid_if_running "$SERVER_PID"
-append_cuda_pids_by_name_prefix "VLLM::Worker" "VLLM::Worker"
-append_cuda_pids_by_name_prefix "VLLM::DPCoordinator" "VLLM::DPCoordinator"
-for (( idx=0; idx<DP_SIZE; idx++ )); do
-  append_cuda_pids_by_name_prefix "VLLM::EngineCore_DP${idx}" "VLLM::EngineCore_DP${idx}"
-done
-for (( idx=0; idx<DP_SIZE; idx++ )); do
-  append_cuda_pids_by_name_prefix "VLLM::APIServer_${idx}" "VLLM::APIServer_${idx}"
-done
+collect_vllm_processes
 
 if [[ "${#CUDA_PIDS[@]}" -eq 0 ]]; then
   echo "No CUDA-checkpointable PIDs found."
   tail -n 100 "$LOGFILE" || true
   exit 1
 fi
+
+compute_criu_root_pids
+
+echo "All discovered vLLM PIDs:"
+for pid in "${ALL_VLLM_PIDS[@]}"; do
+  printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
+done
+
+print_io_uring_processes
+
+if [[ "$ALL_UNDER_SERVER_ROOT" -eq 1 ]]; then
+  echo "All discovered vLLM processes are under root PID $SERVER_PID."
+else
+  echo "Discovered vLLM processes span multiple trees."
+fi
+
+echo "CRIU root PIDs:"
+for pid in "${CRIU_ROOT_PIDS[@]}"; do
+  printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
+done
 
 echo "CUDA PIDs:"
 for pid in "${CUDA_PIDS[@]}"; do
@@ -208,6 +433,28 @@ echo "States after checkpoint:"
 for pid in "${CUDA_PIDS[@]}"; do
   printf "  PID %s: " "$pid"
   sudo "$CUDA_CHECKPOINT_BIN" --get-state --pid "$pid" || true
+done
+
+echo "Running CRIU dump..."
+dump_criu_roots
+
+echo "Running CRIU restore..."
+restore_criu_roots
+sleep 2
+
+echo "criu restore completed"
+
+echo "Re-discovering restored vLLM processes..."
+collect_vllm_processes
+
+if [[ "${#CUDA_PIDS[@]}" -eq 0 ]]; then
+  echo "No restored CUDA-checkpointable PIDs found."
+  exit 1
+fi
+
+echo "Restored CUDA PIDs:"
+for pid in "${CUDA_PIDS[@]}"; do
+  printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
 done
 
 echo "Uncheckpointing in reverse order..."
