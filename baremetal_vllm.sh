@@ -10,7 +10,7 @@ export USE_LIBUV="${USE_LIBUV:-0}"
 
 PORT="${PORT:-8000}"
 DP_SIZE="${DP_SIZE:-4}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.16}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.10}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 LOGFILE="${LOGFILE:-vllm_baremetal.log}"
 CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint}"
@@ -115,6 +115,134 @@ print_io_uring_processes() {
       printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
       grep -n 'anon_inode:\[io_uring\]' "/proc/$pid/maps" 2>/dev/null || true
       ls -l "/proc/$pid/fd" 2>/dev/null | grep 'io_uring' || true
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "  none"
+  fi
+}
+
+print_shm_conflicts() {
+  local pid
+  local path
+  local key
+  local count
+  local found=0
+  declare -A path_counts=()
+  declare -A path_pids=()
+  declare -A path_seen=()
+
+  for pid in "${ALL_VLLM_PIDS[@]}"; do
+    while IFS= read -r path; do
+      [[ -n "$path" ]] || continue
+      key="${pid}:${path}"
+      [[ -n "${path_seen[$key]:-}" ]] && continue
+      path_seen["$key"]=1
+      path_counts["$path"]=$(( ${path_counts["$path"]:-0} + 1 ))
+      path_pids["$path"]+="${pid} "
+    done < <(sed -n 's#.*\(/dev/shm/sem\.[^ ]*\).*#\1#p' "/proc/$pid/maps" 2>/dev/null | sort -u)
+  done
+
+  echo "Shared-memory semaphore paths seen in vLLM processes:"
+  for path in "${!path_counts[@]}"; do
+    found=1
+    count="${path_counts[$path]}"
+    printf "  %s\n" "$path"
+    printf "    seen_in_pids: %s\n" "${path_pids[$path]}"
+    printf "    pid_count: %s\n" "$count"
+    if [[ -e "$path" ]]; then
+      printf "    filesystem_entry_exists: yes\n"
+    else
+      printf "    filesystem_entry_exists: no\n"
+    fi
+    if (( count > 1 )); then
+      printf "    duplicate_name_across_processes: yes\n"
+    else
+      printf "    duplicate_name_across_processes: no\n"
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "  none"
+  fi
+}
+
+print_shm_path_owners() {
+  local path="$1"
+  local proc_dir
+  local pid
+  local fd
+  local target
+  local matched=0
+
+  for proc_dir in /proc/[0-9]*; do
+    pid="${proc_dir##*/}"
+
+    if grep -F -q "$path" "/proc/$pid/maps" 2>/dev/null; then
+      matched=1
+      printf "      owner_pid(map): %s %s\n" "$pid" "$(get_process_name "$pid")"
+      continue
+    fi
+
+    for fd in /proc/"$pid"/fd/*; do
+      [[ -e "$fd" ]] || continue
+      target="$(readlink "$fd" 2>/dev/null || true)"
+      if [[ "$target" == "$path" || "$target" == "$path (deleted)" ]]; then
+        matched=1
+        printf "      owner_pid(fd): %s %s [%s -> %s]\n" \
+          "$pid" "$(get_process_name "$pid")" "${fd##*/}" "$target"
+      fi
+    done
+  done
+
+  if [[ "$matched" -eq 0 ]]; then
+    echo "      owner_pid: none found"
+  fi
+}
+
+print_shm_owner_report() {
+  local pid
+  local path
+  local seen=0
+  declare -A reported_paths=()
+
+  echo "Shared-memory semaphore owner report:"
+  for pid in "${ALL_VLLM_PIDS[@]}"; do
+    while IFS= read -r path; do
+      [[ -n "$path" ]] || continue
+      [[ -n "${reported_paths[$path]:-}" ]] && continue
+      reported_paths["$path"]=1
+      seen=1
+      printf "  %s\n" "$path"
+      print_shm_path_owners "$path"
+    done < <(sed -n 's#.*\(/dev/shm/sem\.[^ ]*\).*#\1#p' "/proc/$pid/maps" 2>/dev/null | sort -u)
+  done
+
+  if [[ "$seen" -eq 0 ]]; then
+    echo "  none"
+  fi
+}
+
+print_process_helpers() {
+  local proc_dir
+  local pid
+  local proc_name
+  local found=0
+
+  echo "Related multiprocessing helpers:"
+  for proc_dir in /proc/[0-9]*; do
+    pid="${proc_dir##*/}"
+    proc_name="$(get_process_name "$pid")"
+    if [[ "$proc_name" == *resource_tracker* || "$proc_name" == *spawn_main* ]]; then
+      found=1
+      printf "  PID %s: %s\n" "$pid" "$proc_name"
+      printf "    parent_pid: %s\n" "$(get_parent_pid "$pid")"
+      if is_descendant_of "$pid" "$SERVER_PID"; then
+        printf "    under_vllm_root: yes\n"
+      else
+        printf "    under_vllm_root: no\n"
+      fi
     fi
   done
 
@@ -407,6 +535,9 @@ for pid in "${ALL_VLLM_PIDS[@]}"; do
 done
 
 print_io_uring_processes
+print_shm_conflicts
+print_shm_owner_report
+print_process_helpers
 
 if [[ "$ALL_UNDER_SERVER_ROOT" -eq 1 ]]; then
   echo "All discovered vLLM processes are under root PID $SERVER_PID."
