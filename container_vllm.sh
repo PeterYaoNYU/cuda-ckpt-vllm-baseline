@@ -32,6 +32,28 @@ request_container() {
     }"
 }
 
+get_container_process_name() {
+  local cid="$1"
+  local pid="$2"
+  local proc_name
+
+  proc_name="$(docker exec "$cid" sh -c "tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null" || true)"
+  if [[ -z "$proc_name" ]]; then
+    proc_name="$(docker exec "$cid" cat "/proc/$pid/comm" 2>/dev/null || true)"
+  fi
+  if [[ -z "$proc_name" ]]; then
+    proc_name="<unknown>"
+  fi
+
+  printf '%s\n' "$proc_name"
+}
+
+get_container_vllm_version() {
+  local cid="$1"
+
+  docker exec "$cid" python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo "<unknown>"
+}
+
 run_one_image() {
   local image="$1"
 
@@ -57,6 +79,7 @@ run_one_image() {
       --enforce-eager)"
 
   echo "Container: $cid"
+  echo "Container vLLM version: $(get_container_vllm_version "$cid")"
 
   echo "Waiting for vLLM..."
   for _ in $(seq 1 300); do
@@ -106,10 +129,13 @@ run_one_image() {
     return 1
   fi
 
-  echo "CUDA PIDs: ${CUDA_PIDS[*]}"
+  echo "CUDA PIDs:"
+  for p in "${CUDA_PIDS[@]}"; do
+    printf "  PID %s: %s\n" "$p" "$(get_container_process_name "$cid" "$p")"
+  done
 
   for p in "${CUDA_PIDS[@]}"; do
-    echo "Checkpointing PID $p"
+    echo "Checkpointing PID $p ($(get_container_process_name "$cid" "$p"))"
     docker exec "$cid" /cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint --toggle --pid "$p"
   done
 
@@ -122,7 +148,7 @@ run_one_image() {
   echo "Uncheckpointing in reverse order..."
   for (( idx=${#CUDA_PIDS[@]}-1 ; idx>=0 ; idx-- )); do
     p="${CUDA_PIDS[idx]}"
-    echo "Uncheckpointing PID $p"
+    echo "Uncheckpointing PID $p ($(get_container_process_name "$cid" "$p"))"
     docker exec "$cid" /cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint --toggle --pid "$p"
   done
 
@@ -145,6 +171,8 @@ run_one_image() {
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 1
   fi
+
+  sleep 10
 }
 
 # Sanity check: Docker can see GPUs
