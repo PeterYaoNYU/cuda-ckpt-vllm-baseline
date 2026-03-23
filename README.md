@@ -264,3 +264,60 @@ The `cuda-checkpoint` utility simply exposes functionality that is contained in 
 
 ## License
 By downloading or using the software, you agree to the terms of the [License Agreement for NVIDIA Software Development Kits — EULA](https://docs.nvidia.com/cuda/eula/index.html).
+
+
+
+
+env CUDA_VISIBLE_DEVICES=3 UV_USE_IO_URING=0 \
+  setsid -f vllm serve Qwen/Qwen3-0.6B \
+    --gpu-memory-utilization 0.8 \
+    --port 8000 \
+    --trust-remote-code \
+    </dev/null >vllm.log 2>&1
+
+export UV_USE_IO_URING=0
+CUDA_VISIBLE_DEVICES=3 \
+setsid -f bash -lc 'exec vllm serve Qwen/Qwen3-0.6B --gpu-memory-utilization 0.8 --port 8000 --trust-remote-code </dev/null >vllm.log 2>&1'
+
+
+ps -o pid,sid,tty,cmd -p  235787
+
+ps -o pid,sid,tty,cmd -p   236035
+
+
+ls -l /proc/236035/fd/0 /proc/236035/fd/1 /proc/236035/fd/2
+ls -l /proc/235787/fd/0 /proc/235787/fd/1 /proc/235787/fd/2
+
+
+
+
+./bin/x86_64_Linux/cuda-checkpoint --toggle --pid 230234
+
+./bin/x86_64_Linux/cuda-checkpoint --toggle --pid 230028
+
+
+
+sudo lsof /dev/shm/link_remap.435 || true
+sudo lsof /dev/shm/sem.EEJUmG || true
+
+
+sudo rm -f /dev/shm/link_remap.*
+
+sudo lsof /dev/shm/sem.EEJUmG || true
+
+sudo rm -f /dev/shm/sem.EEJUmG
+
+
+sudo criu dump   -t 235787 --tree 235787   -D ./checkpoint_vllm5   --shell-job   --tcp-established   --ext-unix-sk --link-remap   -j  > dump2.log 2>&1
+
+
+sudo criu restore \
+  -D ./checkpoint_vllm5 \
+  --restore-detached \
+  --tcp-established --ext-unix-sk --link-remap \
+  > restore4.log 2>&1
+
+do all this in terminal, not vscode terminal.
+
+use sudo and restore both processes. 
+sudo ./bin/x86_64_Linux/cuda-checkpoint --toggle --pid 248011
