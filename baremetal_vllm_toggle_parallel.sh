@@ -16,6 +16,7 @@ LOGFILE="${LOGFILE:-vllm_baremetal_toggle_parallel.log}"
 CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint}"
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-1}"
 VLLM_ROOT_PID="${VLLM_ROOT_PID:-}"
+STATE_LOGFILE="${STATE_LOGFILE:-vllm_baremetal_toggle_parallel.states.log}"
 
 SERVER_PID=""
 CLEANUP_DONE=0
@@ -68,6 +69,26 @@ print_timing_summary() {
   print_timing_line "cuda checkpoint toggle" "$CUDA_TOGGLE_CHECKPOINT_MS"
   print_timing_line "cuda toggle back" "$CUDA_TOGGLE_RESTORE_MS"
   print_timing_line "aggregate" "$AGGREGATE_MS"
+}
+
+get_cuda_state() {
+  local pid="$1"
+  sudo "$CUDA_CHECKPOINT_BIN" --get-state --pid "$pid" 2>&1 || true
+}
+
+record_state_snapshot() {
+  local label="$1"
+  local pid
+  local state
+
+  {
+    printf '=== %s ===\n' "$label"
+    for pid in "${CUDA_PIDS[@]}"; do
+      state="$(get_cuda_state "$pid")"
+      printf 'pid=%s state=%s\n' "$pid" "$state"
+    done
+    printf '\n'
+  } | tee -a "$STATE_LOGFILE"
 }
 
 get_parent_pid() {
@@ -291,6 +312,7 @@ fi
 echo "Server PID: $SERVER_PID"
 echo "vLLM root PID: $VLLM_ROOT_PID"
 echo "Log file: $LOGFILE"
+echo "State log: $STATE_LOGFILE"
 
 echo "Waiting for vLLM..."
 for _ in $(seq 1 300); do
@@ -337,6 +359,8 @@ for pid in "${CUDA_PIDS[@]}"; do
   printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
 done
 
+record_state_snapshot "before toggle"
+
 aggregate_start_ms="$(now_ms)"
 
 phase_start_ms="$(now_ms)"
@@ -345,6 +369,8 @@ if ! run_parallel_toggle "Checkpointing" "${CUDA_PIDS[@]}"; then
   exit 1
 fi
 CUDA_TOGGLE_CHECKPOINT_MS="$(duration_ms "$phase_start_ms" "$(now_ms)")"
+
+record_state_snapshot "after toggle"
 
 declare -a REVERSED_CUDA_PIDS=()
 for (( idx=${#CUDA_PIDS[@]} - 1; idx >= 0; idx-- )); do
@@ -357,6 +383,8 @@ if ! run_parallel_toggle "Uncheckpointing" "${REVERSED_CUDA_PIDS[@]}"; then
   exit 1
 fi
 CUDA_TOGGLE_RESTORE_MS="$(duration_ms "$phase_start_ms" "$(now_ms)")"
+
+record_state_snapshot "after toggle back"
 
 AGGREGATE_MS="$(duration_ms "$aggregate_start_ms" "$(now_ms)")"
 
