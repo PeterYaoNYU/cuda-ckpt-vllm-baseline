@@ -420,7 +420,6 @@ VLLM_ARGS=(
   serve "$MODEL"
   --data-parallel-size "$DP_SIZE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-  --cudagraph-capture-sizes 512
   --disable-log-stats
   --enforce-eager
 )
