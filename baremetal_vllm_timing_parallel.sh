@@ -8,7 +8,7 @@ export VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION="${VLLM_DISABLE_NCCL_FOR_DP_SYNC
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export USE_LIBUV="${USE_LIBUV:-0}"
 
-PORT="${PORT:-8010}"
+PORT="${PORT:-8011}"
 DP_SIZE="${DP_SIZE:-2}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.06}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
@@ -421,7 +421,6 @@ VLLM_ARGS=(
   --data-parallel-size "$DP_SIZE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --disable-log-stats
-  --enforce-eager
 )
 
 if [[ -n "$PORT" ]]; then
