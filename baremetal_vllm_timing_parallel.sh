@@ -126,17 +126,47 @@ find_pids_by_name_prefix() {
   local prefix="$1"
   local pid
   local proc_name
+  local -a candidate_pids=()
 
-  for proc_dir in /proc/[0-9]*; do
-    pid="${proc_dir##*/}"
+  if [[ -n "$VLLM_ROOT_PID" ]] && [[ -d "/proc/$VLLM_ROOT_PID" ]]; then
+    mapfile -t candidate_pids < <(list_descendant_pids "$VLLM_ROOT_PID")
+  else
+    for proc_dir in /proc/[0-9]*; do
+      candidate_pids+=("${proc_dir##*/}")
+    done
+  fi
+
+  for pid in "${candidate_pids[@]}"; do
     proc_name="$(get_process_name "$pid")"
     if [[ "$proc_name" == "$prefix"* ]]; then
-      if [[ -n "$VLLM_ROOT_PID" ]] && ! is_descendant_of "$pid" "$VLLM_ROOT_PID"; then
-        continue
-      fi
       echo "$pid"
     fi
   done | sort -n
+}
+
+list_descendant_pids() {
+  local root="$1"
+  local parent
+  local child
+  local -a frontier=("$root")
+  local -a next_frontier=()
+  local -A seen=()
+
+  while [[ "${#frontier[@]}" -gt 0 ]]; do
+    next_frontier=()
+    for parent in "${frontier[@]}"; do
+      while IFS= read -r child; do
+        [[ -n "$child" ]] || continue
+        [[ -d "/proc/$child" ]] || continue
+        [[ -n "${seen[$child]:-}" ]] && continue
+
+        seen["$child"]=1
+        echo "$child"
+        next_frontier+=("$child")
+      done < <(pgrep -P "$parent" || true)
+    done
+    frontier=("${next_frontier[@]}")
+  done
 }
 
 append_all_pid() {
