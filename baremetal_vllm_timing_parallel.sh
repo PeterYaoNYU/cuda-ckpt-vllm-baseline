@@ -2,15 +2,15 @@
 set -euo pipefail
 
 export MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 export UV_USE_IO_URING="${UV_USE_IO_URING:-0}"
 export VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION="${VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export USE_LIBUV="${USE_LIBUV:-0}"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-8010}"
 DP_SIZE="${DP_SIZE:-2}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.06}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 PRIVATE_SHM_SIZE="${PRIVATE_SHM_SIZE:-16G}"
 IN_PRIVATE_SHM_NS="${IN_PRIVATE_SHM_NS:-0}"
@@ -19,6 +19,7 @@ CUDA_CHECKPOINT_BIN="${CUDA_CHECKPOINT_BIN:-$HOME/cuda-checkpoint/bin/x86_64_Lin
 CRIU_BIN="${CRIU_BIN:-criu}"
 CKPT_DIR="${CKPT_DIR:-$PWD/checkpoint_vllm_baremetal_parallel}"
 CLEANUP_ON_EXIT="${CLEANUP_ON_EXIT:-1}"
+VLLM_ROOT_PID="${VLLM_ROOT_PID:-}"
 
 SERVER_PID=""
 ORIGINAL_SERVER_PID=""
@@ -87,6 +88,23 @@ get_parent_pid() {
   awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true
 }
 
+is_descendant_of() {
+  local pid="$1"
+  local root="$2"
+  local parent
+
+  while [[ -n "$pid" && "$pid" != "0" ]]; do
+    if [[ "$pid" == "$root" ]]; then
+      return 0
+    fi
+    parent="$(get_parent_pid "$pid")"
+    [[ -n "$parent" && "$parent" != "$pid" ]] || break
+    pid="$parent"
+  done
+
+  return 1
+}
+
 get_process_name() {
   local pid="$1"
   local proc_name=""
@@ -113,6 +131,9 @@ find_pids_by_name_prefix() {
     pid="${proc_dir##*/}"
     proc_name="$(get_process_name "$pid")"
     if [[ "$proc_name" == "$prefix"* ]]; then
+      if [[ -n "$VLLM_ROOT_PID" ]] && ! is_descendant_of "$pid" "$VLLM_ROOT_PID"; then
+        continue
+      fi
       echo "$pid"
     fi
   done | sort -n
@@ -421,8 +442,12 @@ printf '\n'
 setsid vllm "${VLLM_ARGS[@]}" >"$LOGFILE" 2>&1 < /dev/null &
 SERVER_PID=$!
 ORIGINAL_SERVER_PID="$SERVER_PID"
+if [[ -z "$VLLM_ROOT_PID" ]]; then
+  VLLM_ROOT_PID="$SERVER_PID"
+fi
 
 echo "Server PID: $SERVER_PID"
+echo "vLLM root PID: $VLLM_ROOT_PID"
 echo "Server mount namespace: $(readlink /proc/$SERVER_PID/ns/mnt)"
 echo "Server IPC namespace:   $(readlink /proc/$SERVER_PID/ns/ipc)"
 echo "Server /dev/shm mount:"
