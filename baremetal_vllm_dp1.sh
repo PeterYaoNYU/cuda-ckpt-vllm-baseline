@@ -217,8 +217,6 @@ pid_matches_checkpoint_target_name() {
 collect_vllm_processes() {
   local pid
   local proc_name
-  local uses_cuda
-  local cuda_state
 
   ALL_VLLM_PIDS=()
   SEEN_ALL_PIDS=()
@@ -227,28 +225,13 @@ collect_vllm_processes() {
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
 
-    proc_name="$(get_process_name "$pid")"
     append_all_pid "$pid"
-
-    if pid_uses_cuda_device "$pid"; then
-      uses_cuda="yes"
-    else
-      uses_cuda="no"
-    fi
-
-    cuda_state="$(get_cuda_checkpoint_state "$pid")"
-
-    printf '  PID %s: uses_cuda=%s checkpointable=%s state=%s name=%s\n' \
-      "$pid" \
-      "$uses_cuda" \
-      "$([[ "$cuda_state" == "running" ]] && echo yes || echo no)" \
-      "${cuda_state:-<none>}" \
-      "$proc_name"
-  done < <(list_vllm_tree_pids | sort -n -u)
+  done < <(list_vllm_tree_pids)
 
   echo "Discovered process names in vLLM tree:"
   for pid in "${ALL_VLLM_PIDS[@]}"; do
-    printf "  PID %s: %s\n" "$pid" "$(get_process_name "$pid")"
+    proc_name="$(get_process_name "$pid")"
+    printf "  PID %s: %s\n" "$pid" "$proc_name"
   done
 }
 
@@ -261,7 +244,7 @@ select_checkpoint_targets() {
   CUDA_PIDS=()
   SEEN_PIDS=()
 
-  echo "Selecting checkpoint targets by process name..."
+  echo "Selecting checkpoint targets by process name within the root subtree..."
   for pid in "${ALL_VLLM_PIDS[@]}"; do
     proc_name="$(get_process_name "$pid")"
     if ! pid_matches_checkpoint_target_name "$pid" "$proc_name"; then
